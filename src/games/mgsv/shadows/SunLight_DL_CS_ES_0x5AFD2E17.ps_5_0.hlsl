@@ -14,6 +14,11 @@
 //   2x2 atlas of 4 cascades x 4096x4096.
 // ---- Created with 3Dmigoto v1.3.16 on Thu Oct 15 03:15:09 2026
 
+// The addon's injected constants, which carry the contact-hardening toggle below.
+// Every MGSV replacement shares this header; it declares cbuffer cb13, a register
+// the vanilla shader does not use.
+#include "../shared.h"
+
 cbuffer cPSScene : register(b2)
 {
 
@@ -435,8 +440,12 @@ void main(
   //   PCSS    : penumbra from blocker distance    variable radius
   //
   // r0.x here is the vanilla lit factor (1 = fully lit, 0 = fully shadowed).
+  //
+  // Gated on a setting, default off. This changes how the scene's shadows read -
+  // a look, not a fix - so the game's intended appearance stays the default. r0.x
+  // already holds the vanilla result above, so skipping the block leaves it alone.
   // =========================================================================
-  {
+  if (CUSTOM_SUN_CONTACT_HARDENING != 0.f) {
     const float  texel     = 1.0 / g_psScene.m_shadowMapResolutions.x;
     const float  atlasSize = g_psScene.m_shadowMapResolutions.x;
     const float2 baseUV    = r4.yz;
