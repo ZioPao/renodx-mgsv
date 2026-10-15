@@ -93,8 +93,8 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 // ---------------------------------------------------------------------------
 #define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = full effect
 #define PCSS_PENUMBRA_K          8.0   // paper uses 80; this depth range is different
-#define PCSS_BLOCKER_RADIUS_TEXELS 20.0 // blocker search max radius, texels
-#define PCSS_FILTER_MAX_TEXELS   64.0  // max shadow filter radius, texels
+#define PCSS_BLOCKER_RADIUS_TEXELS 12.0 // blocker search max radius, texels
+#define PCSS_FILTER_MAX_TEXELS   32.0  // max shadow filter radius, texels
 #define PCSS_FILTER_MIN_TEXELS   0.5   // never harder than vanilla's 0.5 texel PCF
 #define PCSS_BIAS_BASE           0.00005 // normalised depth; cancels the engine's
 #define PCSS_BIAS_SLOPE          2.0     // caster bias, which is slope-scaled
