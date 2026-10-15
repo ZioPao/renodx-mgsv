@@ -89,16 +89,19 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 // roughly 0.009 and is essentially invisible, so any visible softening here is
 // deliberate exaggeration. This is the main "how soft" knob.
 // ---------------------------------------------------------------------------
-#define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = full PCSS
-#define PCSS_PENUMBRA_FRACTION   0.06  // penumbra = worldDistance * this
-#define PCSS_MIN_PENUMBRA_WORLD  0.01  // metres; keeps contacts crisp
-#define PCSS_MAX_PENUMBRA_WORLD  0.50  // metres; cap on the exaggerated softening
+// ---------------------------------------------------------------------------
+// PCSS tuning.
+// During devkit iteration these are edited and the shader is reloaded live.
+// They move into the cb13 ShaderInjectData buffer when this ships.
+//
+// Contact hardening is not implemented (see the notes at the penumbra
+// computation). What remains is a uniform world-space shadow softening.
+// ---------------------------------------------------------------------------
+#define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = softened
+#define PCSS_FIXED_PENUMBRA_WORLD 0.03 // penumbra radius, metres
 #define PCSS_MAX_PENUMBRA_TEXELS 256.0 // safety rail only; must not bind, or it
                                        // reintroduces cascade dependence (one texel
                                        // is 3.2 mm in cascade 0 and 30 mm in cascade 3)
-#define PCSS_BLOCKER_RADIUS_WORLD 0.5   // blocker search radius, metres
-#define PCSS_BIAS_WORLD          0.75  // depth margin, metres; excludes the receiver's own surface
-#define PCSS_BLOCKER_TAPS        16
 #define PCSS_PCF_TAPS            16
 
 // 16-point Poisson disk, unit radius. Same set is used for the blocker search
@@ -428,7 +431,7 @@ void main(
     // That matrix is a *uniform scale times a rotation*: all three of its
     // row/column norms come out equal (0.15202 in the captured frame), so the
     // orthographic box is a cube and 2 / norm is its extent in metres. Do not
-    // read the scale off the diagonal (_m00 / _m22) — for a rotated matrix the
+    // read the scale off the diagonal (_m00 / _m22) ??? for a rotated matrix the
     // diagonal elements are not scale factors, and because this matrix maps
     // *view* space it changes as the camera turns. That is what made the
     // penumbra camera-dependent.
@@ -454,58 +457,28 @@ void main(
     const float zScale = max(abs(g_psScene.m_shadowProjection2._m30), 1e-9);
     const float depthRange = worldPerClip / zScale;
 
-    // Blocker search radius in metres, converted with this cascade's texel size.
-    // A texel-space radius is the other half of the cascade-dependence bug: the
-    // same 16 texels cover a small world area in the near cascade and a huge one
-    // in the far cascade, so the search starts reaching distant terrain as a
-    // "blocker" and every shadow in that cascade goes soft. Clamped so the tap
-    // count stays sane at both extremes.
-    const float blockerRadiusTexels = clamp(PCSS_BLOCKER_RADIUS_WORLD / texelWorld, 4.0, 64.0);
-
-    // The depth bias has to be a world distance too, for the same reason. As a
-    // normalised constant it rejects the receiver's own surface in the near
-    // cascade but not in the far one, where the same search radius spans a much
-    // larger depth range — so terrain starts counting as a blocker and every
-    // shadow in that cascade goes soft.
-    const float bias = PCSS_BIAS_WORLD / depthRange;
-
-    // Blocker search on the raw shadow-map depth.
+    // Penumbra: a fixed world-space radius.
     //
-    // t3 is an R24_UNORM_X8_TYPELESS view of the D24S8 cascade atlas, so the
-    // depth is readable directly with the point sampler; no comparison sampler
-    // needed. Blockers are texels closer to the light than the receiver, i.e.
-    // a smaller depth.
+    // Contact hardening was abandoned here, and both attempts are worth recording
+    // so they are not retried:
     //
-    // The world-space bias keeps the receiver's own surface out of the set. The
-    // engine's caster bias makes the receiver's own texel register as occluded,
-    // and the depth stored at the receiver's own texel is essentially its own
-    // depth (measured ~0.001 difference), so reading it directly gives no signal
-    // at all — the search over a radius is what actually reaches the caster.
-    float blockerSum    = 0.0;
-    float blockerWeight = 0.0;
-    [unroll] for (int i = 0; i < PCSS_BLOCKER_TAPS; ++i) {
-      const float2 p  = kPcssPoisson16[i];
-      const float2 rp = float2(p.x * cs - p.y * sn, p.x * sn + p.y * cs);
-      const float2 uv = clamp(baseUV + rp * (blockerRadiusTexels * texel), uvMin, uvMax);
-      const float  d  = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, uv, 0).x;
-      const float  w  = (d < refZ - bias) ? 1.0 : 0.0;
-      blockerSum += d * w;
-      blockerWeight += w;
-    }
-
-    // Penumbra: wider where the blocker is far from the receiver.
+    //   16-tap blocker search over a 1 m radius. 1 m is ~311 texels in cascade 0,
+    //   so 16 taps land ~78 texels apart and sample unrelated geometry. The
+    //   blocker depth comes back as noise that is usually far closer to the light
+    //   than the receiver, so the penumbra saturates at its ceiling.
     //
-    // Everything here is in metres until the final division, including the floor
-    // and the ceiling. A floor expressed in texels is a floor whose world size
-    // changes with cascade level and camera zoom, which makes the shadow appear
-    // to soften or sharpen as the cascade switches.
-    const float hasBlocker    = saturate(blockerWeight);
-    const float avgBlocker    = blockerSum / max(blockerWeight, 1.0);
-    const float worldDiff     = (refZ - avgBlocker) * depthRange;
-    const float penumbraWorld = clamp(worldDiff * PCSS_PENUMBRA_FRACTION,
-                                      PCSS_MIN_PENUMBRA_WORLD,
-                                      PCSS_MAX_PENUMBRA_WORLD);
+    //   Reading the depth at the receiver's own texel. Measured, this returns the
+    //   engine's own caster depth bias rather than the caster distance: the
+    //   pattern is slope-shaped (large on slopes, ~0 on flat ground), which is a
+    //   slope-scaled rasterizer bias, not a receiver-to-caster distance.
+    //
+    // A fixed radius in metres still improves on vanilla. Vanilla's PCF spans
+    // 0.5 texel, which is 1.6 mm in cascade 0 and 15 mm in cascade 3, so it is
+    // effectively a hard edge at high resolution. This is uniform in world space
+    // across every cascade and removes the shadow aliasing.
+    const float penumbraWorld = PCSS_FIXED_PENUMBRA_WORLD;
     const float penumbra      = min(penumbraWorld / texelWorld, PCSS_MAX_PENUMBRA_TEXELS);
+    const float hasBlocker    = 1.0;
 
     // Variable-radius PCF with the game's own comparison sampler.
     float avg = 0.0;
