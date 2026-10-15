@@ -79,15 +79,25 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 // PCSS (contact hardening) tuning.
 // During devkit iteration these are edited and the shader is reloaded live.
 // They move into the cb13 ShaderInjectData buffer when this ships.
+//
+// Distances and sizes are in metres. The penumbra is derived in world space and
+// only converted to cascade texels at the end, so nothing here depends on which
+// cascade is active or on the camera zoom.
+//
+// PCSS_PENUMBRA_FRACTION is the penumbra as a fraction of the receiver-to-
+// blocker distance. A real sun is only ~0.5 degrees across, which works out to
+// roughly 0.009 and is essentially invisible, so any visible softening here is
+// deliberate exaggeration. This is the main "how soft" knob.
 // ---------------------------------------------------------------------------
-#define PCSS_STRENGTH        1.0   // 0 = vanilla 4-tap PCF, 1 = full PCSS
-#define PCSS_SCALE           800.0 // penumbra = (receiverZ - blockerZ) * SCALE
-#define PCSS_BLOCKER_RADIUS  16.0  // blocker search radius, cascade texels
-#define PCSS_BIAS            0.002 // depth margin that excludes the receiver's own surface
-#define PCSS_MIN_PENUMBRA    1.0   // penumbra floor, texels (keeps contacts crisp)
-#define PCSS_MAX_PENUMBRA    12.0  // penumbra ceiling, texels (perf + bleed guard)
-#define PCSS_BLOCKER_TAPS    16
-#define PCSS_PCF_TAPS        16
+#define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = full PCSS
+#define PCSS_PENUMBRA_FRACTION   0.06  // penumbra = worldDistance * this
+#define PCSS_MIN_PENUMBRA_WORLD  0.01  // metres; keeps contacts crisp
+#define PCSS_MAX_PENUMBRA_WORLD  0.50  // metres; cap on the exaggerated softening
+#define PCSS_MAX_PENUMBRA_TEXELS 32.0  // safety rail for the far cascades
+#define PCSS_BLOCKER_RADIUS_WORLD 0.5   // blocker search radius, metres
+#define PCSS_BIAS_WORLD          0.75  // depth margin, metres; excludes the receiver's own surface
+#define PCSS_BLOCKER_TAPS        16
+#define PCSS_PCF_TAPS            16
 
 // 16-point Poisson disk, unit radius. Same set is used for the blocker search
 // and the PCF so both stay on the same sample pattern.
@@ -312,8 +322,6 @@ void main(
   r4.w = r4.w;
   r4.xyzw = r4.xyzw;
   r4.x = r4.x;
-  // PCSS: blended cascade index, captured before r4.x is halved below.
-  float pcssCascadeIndex = r4.x;
   r8.zw = float2(0.5,0.5) * r4.yz;
   r9.xy = float2(0.5,0.5) + r8.zw;
   r2.w = -r9.y;
@@ -397,16 +405,18 @@ void main(
     const float2 baseUV    = r4.yz;
     const float  refZ      = r4.w;
 
-    // Cascade tile window. Vanilla builds the atlas UV as
-    //   0.5 * localUV + tileOffset
-    // with tileOffset from the blended cascade index, so PCSS taps have to stay
-    // inside [tileOffset, tileOffset + 0.5] or they bleed into the neighbour
-    // cascade. tileOffset is reproduced exactly as vanilla computes it.
-    const float2 tileOffset = float2(
-        pcssCascadeIndex * 0.5 - clamp(pcssCascadeIndex - 1.0, 0.0, 1.0),
-        0.5 * clamp(pcssCascadeIndex - 1.0, 0.0, 1.0));
-    const float2 uvMin = tileOffset + 0.5 * texel;
-    const float2 uvMax = tileOffset + 0.5 - 0.5 * texel;
+    // Cascade tile window. The atlas is a 2x2 grid of 0.5-UV quadrants and the
+    // vanilla UV lands inside exactly one of them, so the tile is simply the
+    // quadrant that contains baseUV.
+    //
+    // Snapping to the quadrant rather than reconstructing vanilla's own tile
+    // offset matters: during a cascade blend that offset is fractional, so the
+    // window slides across two tiles and the blocker search samples depth from
+    // an unrelated part of the world. That yields a bogus blocker depth, hence a
+    // bogus penumbra, and how often it happens depends on the camera.
+    const float2 tileOrigin = floor(baseUV * 2.0) * 0.5;
+    const float2 uvMin = tileOrigin + 0.5 * texel;
+    const float2 uvMax = tileOrigin + 0.5 - 0.5 * texel;
 
     // Per-pixel rotation from the game's own 32x32 noise texture (t12) so the
     // disk does not band.
@@ -415,41 +425,76 @@ void main(
     const float  cs    = cos(angle);
     const float  sn    = sin(angle);
 
-    // 1. Blocker search on the raw shadow-map depth.
+    // How big one shadow texel is, in metres.
+    //
+    // Taken from the projection diagonal: m_shadowProjection maps view space to
+    // shadow clip, so for this orthographic light 2 / |m00| is the world width
+    // the atlas covers and one cascade texel is that over (atlasSize / 2).
+    //
+    // A screen-space-derivative version (length(ddx(viewPos)) / length(ddx(uv)))
+    // was tried and is wrong here: it came back enormous, which collapsed the
+    // penumbra to the floor and made every shadow crisp. Do not reintroduce it
+    // without checking the resulting texel size against this value.
+    const float orthoWidth = 2.0 / max(abs(g_psScene.m_shadowProjection._m00), 1e-6);
+    const float texelWorld = clamp(orthoWidth / (atlasSize * 0.5), 1e-4, 10.0);
+
+    // Depth range of the light's orthographic box.
+    const float depthRange = 2.0 / max(abs(g_psScene.m_shadowProjection._m22), 1e-6);
+
+    // Blocker search radius in metres, converted with this cascade's texel size.
+    // A texel-space radius is the other half of the cascade-dependence bug: the
+    // same 16 texels cover a small world area in the near cascade and a huge one
+    // in the far cascade, so the search starts reaching distant terrain as a
+    // "blocker" and every shadow in that cascade goes soft. Clamped so the tap
+    // count stays sane at both extremes.
+    const float blockerRadiusTexels = clamp(PCSS_BLOCKER_RADIUS_WORLD / texelWorld, 4.0, 64.0);
+
+    // The depth bias has to be a world distance too, for the same reason. As a
+    // normalised constant it rejects the receiver's own surface in the near
+    // cascade but not in the far one, where the same search radius spans a much
+    // larger depth range — so terrain starts counting as a blocker and every
+    // shadow in that cascade goes soft.
+    const float bias = PCSS_BIAS_WORLD / depthRange;
+
+    // Blocker search on the raw shadow-map depth.
     //
     // t3 is an R24_UNORM_X8_TYPELESS view of the D24S8 cascade atlas, so the
     // depth is readable directly with the point sampler; no comparison sampler
     // needed. Blockers are texels closer to the light than the receiver, i.e.
-    // a smaller depth. PCSS_BIAS keeps the receiver's own surface out of the
-    // blocker set — the engine's caster bias makes it register as occluded,
-    // which would otherwise average the blocker depth back up to the receiver
-    // and flatten the penumbra.
+    // a smaller depth.
     //
-    // The light's ortho depth range is very wide, so receiver-to-blocker
-    // distances land in the 0.001..0.02 range in normalised depth. PCSS_SCALE
-    // converts that into cascade texels.
+    // The world-space bias keeps the receiver's own surface out of the set. The
+    // engine's caster bias makes the receiver's own texel register as occluded,
+    // and the depth stored at the receiver's own texel is essentially its own
+    // depth (measured ~0.001 difference), so reading it directly gives no signal
+    // at all — the search over a radius is what actually reaches the caster.
     float blockerSum    = 0.0;
     float blockerWeight = 0.0;
     [unroll] for (int i = 0; i < PCSS_BLOCKER_TAPS; ++i) {
       const float2 p  = kPcssPoisson16[i];
       const float2 rp = float2(p.x * cs - p.y * sn, p.x * sn + p.y * cs);
-      const float2 uv = clamp(baseUV + rp * (PCSS_BLOCKER_RADIUS * texel), uvMin, uvMax);
+      const float2 uv = clamp(baseUV + rp * (blockerRadiusTexels * texel), uvMin, uvMax);
       const float  d  = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, uv, 0).x;
-      const float  w  = (d < refZ - PCSS_BIAS) ? 1.0 : 0.0;
+      const float  w  = (d < refZ - bias) ? 1.0 : 0.0;
       blockerSum += d * w;
       blockerWeight += w;
     }
 
-    // 2. Penumbra: wider where the blocker is far from the receiver.
+    // Penumbra: wider where the blocker is far from the receiver.
     //
-    // hasBlocker gates the whole effect: where the blocker search found nothing
-    // the pixel is lit, and running a wide PCF there would pull neighbouring
-    // shadow texels in and paint a halo around every shadow.
-    const float hasBlocker = saturate(blockerWeight);
-    const float avgBlocker = blockerSum / max(blockerWeight, 1.0);
-    const float penumbra = clamp((refZ - avgBlocker) * PCSS_SCALE, PCSS_MIN_PENUMBRA, PCSS_MAX_PENUMBRA);
+    // Everything here is in metres until the final division, including the floor
+    // and the ceiling. A floor expressed in texels is a floor whose world size
+    // changes with cascade level and camera zoom, which makes the shadow appear
+    // to soften or sharpen as the cascade switches.
+    const float hasBlocker    = saturate(blockerWeight);
+    const float avgBlocker    = blockerSum / max(blockerWeight, 1.0);
+    const float worldDiff     = (refZ - avgBlocker) * depthRange;
+    const float penumbraWorld = clamp(worldDiff * PCSS_PENUMBRA_FRACTION,
+                                      PCSS_MIN_PENUMBRA_WORLD,
+                                      PCSS_MAX_PENUMBRA_WORLD);
+    const float penumbra      = min(penumbraWorld / texelWorld, PCSS_MAX_PENUMBRA_TEXELS);
 
-    // 3. Variable-radius PCF with the game's own comparison sampler.
+    // Variable-radius PCF with the game's own comparison sampler.
     float avg = 0.0;
     [unroll] for (int j = 0; j < PCSS_PCF_TAPS; ++j) {
       const float2 p  = kPcssPoisson16[j];
