@@ -81,10 +81,11 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 // They move into the cb13 ShaderInjectData buffer when this ships.
 // ---------------------------------------------------------------------------
 #define PCSS_STRENGTH        1.0   // 0 = vanilla 4-tap PCF, 1 = full PCSS
-#define PCSS_SCALE           300.0 // penumbra = (receiverZ - blockerZ) * SCALE
-#define PCSS_BLOCKER_RADIUS  8.0   // blocker search radius, cascade texels
+#define PCSS_SCALE           800.0 // penumbra = (receiverZ - blockerZ) * SCALE
+#define PCSS_BLOCKER_RADIUS  16.0  // blocker search radius, cascade texels
+#define PCSS_BIAS            0.002 // depth margin that excludes the receiver's own surface
 #define PCSS_MIN_PENUMBRA    1.0   // penumbra floor, texels (keeps contacts crisp)
-#define PCSS_MAX_PENUMBRA    24.0  // penumbra ceiling, texels (perf + bleed guard)
+#define PCSS_MAX_PENUMBRA    12.0  // penumbra ceiling, texels (perf + bleed guard)
 #define PCSS_BLOCKER_TAPS    16
 #define PCSS_PCF_TAPS        16
 
@@ -414,31 +415,39 @@ void main(
     const float  cs    = cos(angle);
     const float  sn    = sin(angle);
 
-    // 1. Blocker search.
+    // 1. Blocker search on the raw shadow-map depth.
     //
-    // The blocker test is driven by the game's own comparison sampler rather
-    // than an explicit depth compare: that keeps it consistent with whatever
-    // depth convention and caster bias the engine uses. The raw depth is then
-    // read separately (t3 is an R24_UNORM_X8_TYPELESS view of the D24S8 atlas,
-    // so no comparison sampler is needed for the depth value itself).
+    // t3 is an R24_UNORM_X8_TYPELESS view of the D24S8 cascade atlas, so the
+    // depth is readable directly with the point sampler; no comparison sampler
+    // needed. Blockers are texels closer to the light than the receiver, i.e.
+    // a smaller depth. PCSS_BIAS keeps the receiver's own surface out of the
+    // blocker set — the engine's caster bias makes it register as occluded,
+    // which would otherwise average the blocker depth back up to the receiver
+    // and flatten the penumbra.
+    //
+    // The light's ortho depth range is very wide, so receiver-to-blocker
+    // distances land in the 0.001..0.02 range in normalised depth. PCSS_SCALE
+    // converts that into cascade texels.
     float blockerSum    = 0.0;
     float blockerWeight = 0.0;
     [unroll] for (int i = 0; i < PCSS_BLOCKER_TAPS; ++i) {
       const float2 p  = kPcssPoisson16[i];
       const float2 rp = float2(p.x * cs - p.y * sn, p.x * sn + p.y * cs);
       const float2 uv = clamp(baseUV + rp * (PCSS_BLOCKER_RADIUS * texel), uvMin, uvMax);
-      const float  occ = g_ShadowTexture.SampleCmpLevelZero(g_samplerComparisonLess_Linear_Clmap_s, uv, refZ).x;
-      const float  d   = g_ShadowTexture.Load(int3(uv * atlasSize, 0)).x;
-      blockerSum += d * occ;
-      blockerWeight += occ;
+      const float  d  = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, uv, 0).x;
+      const float  w  = (d < refZ - PCSS_BIAS) ? 1.0 : 0.0;
+      blockerSum += d * w;
+      blockerWeight += w;
     }
 
     // 2. Penumbra: wider where the blocker is far from the receiver.
-    const float avgBlocker = blockerSum / max(blockerWeight, 1e-5);
-    float penumbra = PCSS_MAX_PENUMBRA;
-    if (blockerWeight > 0.0) {
-      penumbra = clamp(abs(refZ - avgBlocker) * PCSS_SCALE, PCSS_MIN_PENUMBRA, PCSS_MAX_PENUMBRA);
-    }
+    //
+    // hasBlocker gates the whole effect: where the blocker search found nothing
+    // the pixel is lit, and running a wide PCF there would pull neighbouring
+    // shadow texels in and paint a halo around every shadow.
+    const float hasBlocker = saturate(blockerWeight);
+    const float avgBlocker = blockerSum / max(blockerWeight, 1.0);
+    const float penumbra = clamp((refZ - avgBlocker) * PCSS_SCALE, PCSS_MIN_PENUMBRA, PCSS_MAX_PENUMBRA);
 
     // 3. Variable-radius PCF with the game's own comparison sampler.
     float avg = 0.0;
@@ -453,7 +462,7 @@ void main(
     float pcssLit = 1.0 - avg;
     pcssLit *= pcssLit;  // keep vanilla's squaring
 
-    r0.x = lerp(r0.x, pcssLit, PCSS_STRENGTH);
+    r0.x = lerp(r0.x, pcssLit, PCSS_STRENGTH * hasBlocker);
   }
 
   r4.xy = float2(-0,-0);
