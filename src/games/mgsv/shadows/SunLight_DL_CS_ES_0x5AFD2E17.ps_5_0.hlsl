@@ -76,54 +76,48 @@ Texture2D<float4> g_RandomTexture : register(t12);
 Texture2D<float4> g_SkyReflectTexture : register(t15);
 
 // ---------------------------------------------------------------------------
-// PCSS (contact hardening) tuning.
-// During devkit iteration these are edited and the shader is reloaded live.
-// They move into the cb13 ShaderInjectData buffer when this ships.
+// Contact-hardening soft shadows, after Wojciech Sterna, "Contact-hardening
+// Soft Shadows Made Fast" (2018), section 2.1. Sections 2.2 (penumbra mask) and
+// 2.3 (min filter) both need extra passes, so only the regular solution is
+// implementable from a single shader replacement.
 //
-// Distances and sizes are in metres. The penumbra is derived in world space and
-// only converted to cascade texels at the end, so nothing here depends on which
-// cascade is active or on the camera zoom.
+// The paper's algorithm:
+//   blocker search : 16 Vogel disk taps inside a fixed max radius
+//   penumbra       : p = (z - avgBlocker) / avgBlocker;  saturate(K * p * p)
+//   filter         : 16 Vogel disk taps scaled by penumbra * maxFilterSize
 //
-// PCSS_PENUMBRA_FRACTION is the penumbra as a fraction of the receiver-to-
-// blocker distance. A real sun is only ~0.5 degrees across, which works out to
-// roughly 0.009 and is essentially invisible, so any visible softening here is
-// deliberate exaggeration. This is the main "how soft" knob.
+// The penumbra is a *relative* ratio, so it is independent of the depth range
+// and of the shadow map's absolute units. That is the part the previous attempt
+// got wrong: it used an absolute distance in metres, floored and capped, which
+// pinned to one of the two bounds instead of varying.
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// PCSS tuning.
-// During devkit iteration these are edited and the shader is reloaded live.
-// They move into the cb13 ShaderInjectData buffer when this ships.
-//
-// Contact hardening is not implemented (see the notes at the penumbra
-// computation). What remains is a uniform world-space shadow softening.
-// ---------------------------------------------------------------------------
-#define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = softened
-#define PCSS_FIXED_PENUMBRA_WORLD 0.03 // penumbra radius, metres
-#define PCSS_MAX_PENUMBRA_TEXELS 256.0 // safety rail only; must not bind, or it
-                                       // reintroduces cascade dependence (one texel
-                                       // is 3.2 mm in cascade 0 and 30 mm in cascade 3)
+#define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = full effect
+#define PCSS_PENUMBRA_K          8.0   // paper uses 80; this depth range is different
+#define PCSS_BLOCKER_RADIUS_TEXELS 20.0 // blocker search max radius, texels
+#define PCSS_FILTER_MAX_TEXELS   64.0  // max shadow filter radius, texels
+#define PCSS_FILTER_MIN_TEXELS   0.5   // never harder than vanilla's 0.5 texel PCF
+#define PCSS_BIAS_BASE           0.00005 // normalised depth; cancels the engine's
+#define PCSS_BIAS_SLOPE          2.0     // caster bias, which is slope-scaled
+#define PCSS_BIAS_MAX            0.002   // cap, normalised depth
 #define PCSS_PCF_TAPS            16
 
-// 16-point Poisson disk, unit radius. Same set is used for the blocker search
-// and the PCF so both stay on the same sample pattern.
-static const float2 kPcssPoisson16[16] = {
-    float2(-0.94201624, -0.39906216),
-    float2( 0.94558609, -0.76890725),
-    float2(-0.09418410, -0.92938870),
-    float2( 0.34495938,  0.29387760),
-    float2(-0.91588581,  0.45771432),
-    float2(-0.81544232, -0.87912464),
-    float2(-0.38277543,  0.27676845),
-    float2( 0.97484398,  0.75648379),
-    float2( 0.44323325, -0.97511554),
-    float2( 0.53742981, -0.47373420),
-    float2(-0.26496911, -0.41893023),
-    float2( 0.79197514,  0.19090188),
-    float2(-0.24188840,  0.99706507),
-    float2(-0.81409955,  0.91437590),
-    float2( 0.19984126,  0.78641367),
-    float2( 0.14383161, -0.14100790),
-};
+// Vogel disk: spreads samples evenly on a disk and, unlike a Poisson set, never
+// maps a sample onto another under rotation unless the rotation is a full turn.
+static const float kPcssGoldenAngle = 2.39996323;  // pi * (3 - sqrt(5))
+
+// Interleaved gradient noise (Jimenez), the paper's per-pixel rotation source.
+float PcssInterleavedGradientNoise(float2 position_screen) {
+  const float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+  return frac(magic.z * frac(dot(position_screen, magic.xy)));
+}
+
+float2 PcssVogelDisk(int sampleIndex, int samplesCount, float phi) {
+  const float r = sqrt((float)sampleIndex + 0.5) / sqrt((float)samplesCount);
+  const float theta = (float)sampleIndex * kPcssGoldenAngle + phi;
+  float sine, cosine;
+  sincos(theta, sine, cosine);
+  return float2(r * cosine, r * sine);
+}
 
 // 3Dmigoto declarations
 #define cmp -
@@ -419,73 +413,76 @@ void main(
     const float2 uvMin = tileOrigin + 0.5 * texel;
     const float2 uvMax = tileOrigin + 0.5 - 0.5 * texel;
 
-    // Per-pixel rotation from the game's own 32x32 noise texture (t12) so the
-    // disk does not band.
-    const float2 noise = g_RandomTexture.Sample(g_samplerLinear_Wrap_s, (v0.xy - 0.5) * 0.03125).xy;
-    const float  angle = noise.x * 6.28318530718;
-    const float  cs    = cos(angle);
-    const float  sn    = sin(angle);
+    // Per-pixel rotation. The paper uses interleaved gradient noise; the game's
+    // own 32x32 noise texture (t12) would work too but IGN is free and matches
+    // the reference.
+    const float angle = PcssInterleavedGradientNoise(v0.xy) * 6.28318530718;
+    const float cs    = cos(angle);
+    const float sn    = sin(angle);
 
-    // Light-space metrics, measured from m_shadowProjection.
+    // The paper's penumbra is a relative ratio, so it needs neither the light's
+    // ortho extent nor its depth range. Those were measured anyway and are worth
+    // keeping for reference, because two earlier attempts were built on wrong
+    // values for them:
     //
-    // That matrix is a *uniform scale times a rotation*: all three of its
-    // row/column norms come out equal (0.15202 in the captured frame), so the
-    // orthographic box is a cube and 2 / norm is its extent in metres. Do not
-    // read the scale off the diagonal (_m00 / _m22) ??? for a rotated matrix the
-    // diagonal elements are not scale factors, and because this matrix maps
-    // *view* space it changes as the camera turns. That is what made the
-    // penumbra camera-dependent.
-    const float clipScale = length(g_psScene.m_shadowProjection._m00_m10_m20);
-    const float worldPerClip = 1.0 / max(clipScale, 1e-9);
+    //   clipScale    = length(m_shadowProjection._m00_m10_m20) = 0.15202
+    //   ortho extent = 2 / clipScale = 13.16 m (cascade 0, a cube)
+    //   depthRange   = worldPerClip / |m_shadowProjection2._m30| = 622.9 m
+    //   cascade ladder (m_shadowProjection2._m03 / _m13 / _m23):
+    //                  0.41376 / 0.20271 / 0.10708 -> 31.8 / 64.9 / 122.9 m
+    //
+    // m_shadowProjection is a uniform scale times a rotation, so its diagonal is
+    // NOT the scale, and because it maps view space it changes as the camera
+    // turns. Do not read _m00 or _m22 off it.
 
-    // Per-cascade scale. m_shadowProjection2's rows 0..2 hold (offset.xyz, scale)
-    // and their .w values are the cascade ladder (0.41376 / 0.20271 / 0.10708 in
-    // the captured frame), so cascade i's ortho extent is 2 / clipScale / scale_i.
-    const float cascadeIndex = tileXY.x + 2.0 * tileXY.y;
-    const float cascadeScale = cascadeIndex < 0.5 ? 1.0
-                             : cascadeIndex < 1.5 ? abs(g_psScene.m_shadowProjection2._m03)
-                             : cascadeIndex < 2.5 ? abs(g_psScene.m_shadowProjection2._m13)
-                                                  : abs(g_psScene.m_shadowProjection2._m23);
+    // ---- Blocker search (paper section 2.1) ---------------------------------
+    //
+    // 16 Vogel taps inside a fixed max radius. The paper's blocker test has no
+    // explicit bias because in its demo the receiver's own surface and the shadow
+    // map agree to within rounding. MGSV renders casters with a slope-scaled
+    // rasterizer depth bias, so the receiver's own texels land slightly closer to
+    // the light and would be counted as blockers, pinning the penumbra. Hence the
+    // bias below, which reconstructs that rasterizer bias from the receiver's own
+    // depth gradient (normalised depth per texel).
+    const float texelsPerPixel = max(length(ddx(baseUV)) * atlasSize, 1e-6);
+    const float slopePerTexel  = abs(ddx(refZ)) / texelsPerPixel;
+    const float bias = min(PCSS_BIAS_BASE + PCSS_BIAS_SLOPE * slopePerTexel, PCSS_BIAS_MAX);
 
-    // One cascade texel, in metres, for this pixel's cascade. Cascade 0 comes out
-    // at ~3.2 mm and cascade 3 at ~30 mm with the captured matrices.
-    const float cascadeTexels = atlasSize * 0.5;  // 4096 in the 8192 atlas
-    const float texelWorld = (2.0 * worldPerClip) / cascadeTexels / max(cascadeScale, 1e-6);
+    float blockerSum    = 0.0;
+    float blockerWeight = 0.0;
+    [unroll] for (int i = 0; i < PCSS_PCF_TAPS; ++i) {
+      const float2 v  = PcssVogelDisk(i, PCSS_PCF_TAPS, angle);
+      const float2 uv = clamp(baseUV + v * (PCSS_BLOCKER_RADIUS_TEXELS * texel), uvMin, uvMax);
+      const float  d  = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, uv, 0).x;
+      const float  w  = (d < refZ - bias) ? 1.0 : 0.0;
+      blockerSum += d * w;
+      blockerWeight += w;
+    }
 
-    // Normalised shadow depth -> metres. Vanilla's refZ is (1 + clipZ) * zScale,
-    // so one refZ unit spans worldPerClip / zScale (~623 m in the captured frame).
-    const float zScale = max(abs(g_psScene.m_shadowProjection2._m30), 1e-9);
-    const float depthRange = worldPerClip / zScale;
+    // ---- Penumbra (paper section 2.1) --------------------------------------
+    //
+    //   p = (z - avgBlocker) / avgBlocker;  penumbra = saturate(K * p * p)
+    //
+    // A *relative* ratio, so it needs no depth range and does not depend on the
+    // shadow map's absolute units. That is what the earlier attempt got wrong: it
+    // used an absolute distance in metres, floored and capped, so it pinned to
+    // one of the two bounds instead of varying.
+    //
+    // No blockers means no penumbra, which keeps the shadow hard rather than
+    // smearing it across the whole cascade.
+    const float avgBlocker = blockerSum / max(blockerWeight, 1.0);
+    const float relDiff    = (refZ - avgBlocker) / max(avgBlocker, 1e-9);
+    const float penumbra01 = (blockerWeight > 0.0) ? saturate(PCSS_PENUMBRA_K * relDiff * relDiff) : 0.0;
 
-    // Penumbra: a fixed world-space radius.
-    //
-    // Contact hardening was abandoned here, and both attempts are worth recording
-    // so they are not retried:
-    //
-    //   16-tap blocker search over a 1 m radius. 1 m is ~311 texels in cascade 0,
-    //   so 16 taps land ~78 texels apart and sample unrelated geometry. The
-    //   blocker depth comes back as noise that is usually far closer to the light
-    //   than the receiver, so the penumbra saturates at its ceiling.
-    //
-    //   Reading the depth at the receiver's own texel. Measured, this returns the
-    //   engine's own caster depth bias rather than the caster distance: the
-    //   pattern is slope-shaped (large on slopes, ~0 on flat ground), which is a
-    //   slope-scaled rasterizer bias, not a receiver-to-caster distance.
-    //
-    // A fixed radius in metres still improves on vanilla. Vanilla's PCF spans
-    // 0.5 texel, which is 1.6 mm in cascade 0 and 15 mm in cascade 3, so it is
-    // effectively a hard edge at high resolution. This is uniform in world space
-    // across every cascade and removes the shadow aliasing.
-    const float penumbraWorld = PCSS_FIXED_PENUMBRA_WORLD;
-    const float penumbra      = min(penumbraWorld / texelWorld, PCSS_MAX_PENUMBRA_TEXELS);
-    const float hasBlocker    = 1.0;
+    // Scale the fixed max filter kernel. The floor keeps the result from getting
+    // harder than vanilla's 0.5 texel PCF.
+    const float penumbra = lerp(PCSS_FILTER_MIN_TEXELS, PCSS_FILTER_MAX_TEXELS, penumbra01);
 
     // Variable-radius PCF with the game's own comparison sampler.
     float avg = 0.0;
     [unroll] for (int j = 0; j < PCSS_PCF_TAPS; ++j) {
-      const float2 p  = kPcssPoisson16[j];
-      const float2 rp = float2(p.x * cs - p.y * sn, p.x * sn + p.y * cs);
-      const float2 uv = clamp(baseUV + rp * (penumbra * texel), uvMin, uvMax);
+      const float2 v  = PcssVogelDisk(j, PCSS_PCF_TAPS, angle);
+      const float2 uv = clamp(baseUV + v * (penumbra * texel), uvMin, uvMax);
       avg += g_ShadowTexture.SampleCmp(g_samplerComparisonLess_Linear_Clmap_s, uv, refZ).x;
     }
     avg /= (float)PCSS_PCF_TAPS;
@@ -493,7 +490,7 @@ void main(
     float pcssLit = 1.0 - avg;
     pcssLit *= pcssLit;  // keep vanilla's squaring
 
-    r0.x = lerp(r0.x, pcssLit, PCSS_STRENGTH * hasBlocker);
+    r0.x = lerp(r0.x, pcssLit, PCSS_STRENGTH);
   }
 
   r4.xy = float2(-0,-0);
