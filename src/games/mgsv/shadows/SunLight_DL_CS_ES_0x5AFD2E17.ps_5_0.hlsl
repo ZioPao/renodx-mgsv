@@ -98,7 +98,15 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
                                        // the gradient - the hardening itself -
                                        // disappears. relDiff is ~0.12 for a caster
                                        // a metre up, so K near 32 leaves headroom.
-#define PCSS_PENUMBRA_MIN_WORLD  0.01  // penumbra at penumbra01 = 0, metres
+#define PCSS_PENUMBRA_MIN_WORLD  0.0   // penumbra at penumbra01 = 0, metres. Zero, not a
+                                       // centimetre. A caster with no separation has to
+                                       // reproduce vanilla exactly, and vanilla's PCF
+                                       // radius is 0.5 texels (1.6 mm). A 1 cm floor
+                                       // blurs *every* pixel, including the ones contact
+                                       // hardening exists to leave alone, and a 1 cm
+                                       // blur fills in the centimetre-scale gaps in a
+                                       // canopy's dappling. That reads as a translucent
+                                       // veil rather than a soft shadow.
 #define PCSS_PENUMBRA_MAX_WORLD  0.05  // penumbra at penumbra01 = 1, metres. Keep this
                                        // under half the width of the smallest shadow
                                        // you care about, or its dark core disappears
@@ -114,10 +122,29 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 #define PCSS_FILTER_MAX_TEXELS   128.0 // sampling guard, texels; rarely binds
 #define PCSS_FILTER_MIN_TEXELS   0.5   // never harder than vanilla's 0.5 texel PCF
 #define PCSS_PCF_TAPS            32
+#define PCSS_PENUMBRA_TAPS        9     // neighbours averaged into the penumbra mask.
+                                        // A 3x3 grid, so the average is a true box
+                                        // blur of the mask rather than a random
+                                        // sample of it: rotation noise is the thing
+                                        // the mask exists to remove.
+#define PCSS_PENUMBRA_BLUR_PIXELS 6.0   // spacing of those neighbours, screen pixels.
+                                        // The paper blurs its quarter-res mask with
+                                        // a 7x7 Gaussian at sigma 3, about a 12 pixel
+                                        // radius at full resolution.
 
 // Vogel disk: spreads samples evenly on a disk and, unlike a Poisson set, never
 // maps a sample onto another under rotation unless the rotation is a full turn.
 static const float kPcssGoldenAngle = 2.39996323;  // pi * (3 - sqrt(5))
+
+// Neighbours the penumbra is averaged over, in units of PCSS_PENUMBRA_BLUR_PIXELS.
+// A fixed grid, not a rotated disk: the point is to average the mask, so any
+// per-pixel variation in the sample positions would re-introduce the noise the
+// averaging is there to remove.
+static const float2 kPcssPenumbraOffsets[9] = {
+  float2(-1.0, -1.0), float2(0.0, -1.0), float2(1.0, -1.0),
+  float2(-1.0,  0.0), float2(0.0,  0.0), float2(1.0,  0.0),
+  float2(-1.0,  1.0), float2(0.0,  1.0), float2(1.0,  1.0),
+};
 
 // Interleaved gradient noise (Jimenez), the paper's per-pixel rotation source.
 float PcssInterleavedGradientNoise(float2 position_screen) {
@@ -464,22 +491,43 @@ void main(
     // player happened to be standing in — soft on distant terrain, vanilla on
     // nearby objects.
     //
-    // occ gates it: on a lit surface the stored depth is the receiver's own
-    // surface plus the engine's rasterizer bias, which is meaningless as a
-    // blocker. The comparison sampler is linear, so the ramp is smooth.
-    const float occ    = g_ShadowTexture.SampleCmpLevelZero(g_samplerComparisonLess_Linear_Clmap_s, baseUV, refZ).x;
-    const float caster = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, baseUV, 0).x;
-
-    // ---- Penumbra (paper section 2.1) --------------------------------------
+    // ---- Penumbra mask, smoothed across screen space (paper section 2.2) ----
     //
     //   p = (z - caster) / caster;  penumbra = saturate(K * p * p)
     //
     // A *relative* ratio, so it needs no depth range and does not depend on the
-    // shadow map's absolute units. An earlier attempt at the own-texel read was
-    // abandoned because it scaled a fixed constant instead of this ratio and was
-    // not gated on occlusion, so it either did nothing or was uniformly soft.
-    const float relDiff    = (refZ - caster) / max(caster, 1e-9);
-    const float penumbra01 = occ * saturate(PCSS_PENUMBRA_K * relDiff * relDiff);
+    // shadow map's absolute units.
+    //
+    // The ratio is evaluated at *neighbouring pixels* and averaged, not only
+    // here. That is the paper's penumbra mask blur, and it is the fix for the
+    // symptom the paper's figure 7 names: a single-pixel penumbra jitters, because
+    // neighbouring pixels land in regions of zero and of maximum penumbra, so the
+    // shadow's lightness varies pixel to pixel and reads as a translucent veil
+    // rather than a soft edge. Averaging the penumbra removes that jitter without
+    // touching the shadow, which is why it cannot lighten the shadow's core the
+    // way blurring the shadow itself does.
+    //
+    // The paper renders the mask at quarter resolution in its own pass and blurs
+    // it, for speed. Within a cascade the shadow-space UV and depth are affine in
+    // screen space, so ddx/ddy carry a neighbouring pixel's UV and depth exactly
+    // and the penumbra can be evaluated at neighbours here - no repeated cascade
+    // math, no extra pass, and no binding a spare slot. Same mask, same blur.
+    const float2 uvStepX = ddx(baseUV);
+    const float2 uvStepY = ddy(baseUV);
+    const float  zStepX  = ddx(refZ);
+    const float  zStepY  = ddy(refZ);
+
+    float penumbra01 = 0.0;
+    [unroll] for (int k = 0; k < PCSS_PENUMBRA_TAPS; ++k) {
+      const float2 o       = kPcssPenumbraOffsets[k] * PCSS_PENUMBRA_BLUR_PIXELS;
+      const float2 uvN     = baseUV + o.x * uvStepX + o.y * uvStepY;
+      const float  zN      = refZ   + o.x * zStepX  + o.y * zStepY;
+      const float  occN    = g_ShadowTexture.SampleCmpLevelZero(g_samplerComparisonLess_Linear_Clmap_s, uvN, zN).x;
+      const float  casterN = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, uvN, 0).x;
+      const float  relN    = (zN - casterN) / max(casterN, 1e-9);
+      penumbra01 += occN * saturate(PCSS_PENUMBRA_K * relN * relN);
+    }
+    penumbra01 /= (float)PCSS_PENUMBRA_TAPS;
 
     // Per-cascade texel size, from m_shadowProjection2's cascade ladder. Needed to
     // express the penumbra in metres: a texel-space radius makes the blur's world
@@ -503,11 +551,23 @@ void main(
     const float penumbra = clamp(penumbraWorld / texelWorld, PCSS_FILTER_MIN_TEXELS, PCSS_FILTER_MAX_TEXELS);
 
     // Variable-radius PCF with the game's own comparison sampler.
+    //
+    // GatherCmp, not SampleCmp. A disk PCF's taps are spread over an area, so
+    // their spacing is R * sqrt(pi / N): at a 25 texel radius that is 11 texels
+    // with 16 taps and 7.8 with 32. The average is then 32 random draws from the
+    // shadow's coverage rather than a mean of it, and per-pixel rotation turns
+    // that into dithering, which reads as translucency rather than a blur.
+    //
+    // GatherCmp returns four comparisons per instruction, so the same instruction
+    // count buys four times the density - 3.9 texels at that radius instead of
+    // 7.8. This is the paper's section 1.1 speed trick used for the opposite
+    // purpose: not to save samples, but to spend them.
     float avg = 0.0;
     [unroll] for (int j = 0; j < PCSS_PCF_TAPS; ++j) {
       const float2 v  = PcssVogelDisk(j, PCSS_PCF_TAPS, angle);
       const float2 uv = clamp(baseUV + v * (penumbra * texel), uvMin, uvMax);
-      avg += g_ShadowTexture.SampleCmp(g_samplerComparisonLess_Linear_Clmap_s, uv, refZ).x;
+      const float4 g  = g_ShadowTexture.GatherCmp(g_samplerComparisonLess_Linear_Clmap_s, uv, refZ);
+      avg += dot(g, 0.25);
     }
     avg /= (float)PCSS_PCF_TAPS;
 
