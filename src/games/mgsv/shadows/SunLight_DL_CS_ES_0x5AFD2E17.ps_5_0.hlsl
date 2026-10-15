@@ -122,12 +122,12 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 #define PCSS_FILTER_MAX_TEXELS   128.0 // sampling guard, texels; rarely binds
 #define PCSS_FILTER_MIN_TEXELS   0.5   // never harder than vanilla's 0.5 texel PCF
 #define PCSS_PCF_TAPS            32
-#define PCSS_PENUMBRA_TAPS        9     // neighbours averaged into the penumbra mask.
-                                        // A 3x3 grid, so the average is a true box
+#define PCSS_PENUMBRA_TAPS        25    // neighbours averaged into the penumbra mask.
+                                        // A 5x5 grid, so the average is a true box
                                         // blur of the mask rather than a random
                                         // sample of it: rotation noise is the thing
                                         // the mask exists to remove.
-#define PCSS_PENUMBRA_BLUR_PIXELS 6.0   // spacing of those neighbours, screen pixels.
+#define PCSS_PENUMBRA_BLUR_PIXELS 9.0   // spacing of those neighbours, screen pixels.
                                         // The paper blurs its quarter-res mask with
                                         // a 7x7 Gaussian at sigma 3, about a 12 pixel
                                         // radius at full resolution.
@@ -136,15 +136,12 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 // maps a sample onto another under rotation unless the rotation is a full turn.
 static const float kPcssGoldenAngle = 2.39996323;  // pi * (3 - sqrt(5))
 
-// Neighbours the penumbra is averaged over, in units of PCSS_PENUMBRA_BLUR_PIXELS.
-// A fixed grid, not a rotated disk: the point is to average the mask, so any
-// per-pixel variation in the sample positions would re-introduce the noise the
-// averaging is there to remove.
-static const float2 kPcssPenumbraOffsets[9] = {
-  float2(-1.0, -1.0), float2(0.0, -1.0), float2(1.0, -1.0),
-  float2(-1.0,  0.0), float2(0.0,  0.0), float2(1.0,  0.0),
-  float2(-1.0,  1.0), float2(0.0,  1.0), float2(1.0,  1.0),
-};
+// Grid the penumbra is averaged over: PCSS_PENUMBRA_TAPS neighbours on a
+// PCSS_PENUMBRA_TAPS^0.5 square, in units of PCSS_PENUMBRA_BLUR_PIXELS. A fixed
+// grid, not a rotated disk - the point is to average the mask, so any per-pixel
+// variation in the sample positions would re-introduce the noise the averaging
+// exists to remove.
+#define PCSS_PENUMBRA_GRID 5
 
 // Interleaved gradient noise (Jimenez), the paper's per-pixel rotation source.
 float PcssInterleavedGradientNoise(float2 position_screen) {
@@ -519,7 +516,8 @@ void main(
 
     float penumbra01 = 0.0;
     [unroll] for (int k = 0; k < PCSS_PENUMBRA_TAPS; ++k) {
-      const float2 o       = kPcssPenumbraOffsets[k] * PCSS_PENUMBRA_BLUR_PIXELS;
+      const float2 o       = (float2(k % PCSS_PENUMBRA_GRID, k / PCSS_PENUMBRA_GRID)
+                              - (PCSS_PENUMBRA_GRID - 1) * 0.5) * PCSS_PENUMBRA_BLUR_PIXELS;
       const float2 uvN     = baseUV + o.x * uvStepX + o.y * uvStepY;
       const float  zN      = refZ   + o.x * zStepX  + o.y * zStepY;
       const float  occN    = g_ShadowTexture.SampleCmpLevelZero(g_samplerComparisonLess_Linear_Clmap_s, uvN, zN).x;
