@@ -93,12 +93,19 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 // ---------------------------------------------------------------------------
 #define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = full effect
 #define PCSS_PENUMBRA_K          8.0   // paper uses 80; this depth range is different
-#define PCSS_BLOCKER_RADIUS_TEXELS 12.0 // blocker search max radius, texels
-#define PCSS_FILTER_MAX_TEXELS   32.0  // max shadow filter radius, texels
+#define PCSS_FILTER_MAX_TEXELS   16.0  // max shadow filter radius, texels. Kept in
+                                       // texels on purpose: it keeps the tap spacing
+                                       // uniform in every cascade, and it naturally
+                                       // gives a large world blur in the coarse far
+                                       // cascades. Too high a value lightens the
+                                       // interior of small shadows - 32 texels is
+                                       // 10 cm in cascade 0, which is most of a
+                                       // character's shadow, so the core washes out
+                                       // while the edge survives.
 #define PCSS_FILTER_MIN_TEXELS   0.5   // never harder than vanilla's 0.5 texel PCF
-#define PCSS_BIAS_BASE           0.00005 // normalised depth; cancels the engine's
-#define PCSS_BIAS_SLOPE          2.0     // caster bias, which is slope-scaled
-#define PCSS_BIAS_MAX            0.002   // cap, normalised depth
+#define PCSS_BIAS                0.0001 // normalised depth (~6 cm); margin below the
+                                        // disk's own mean depth that a real caster
+                                        // must clear
 #define PCSS_PCF_TAPS            16
 
 // Vogel disk: spreads samples evenly on a disk and, unlike a Poisson set, never
@@ -435,44 +442,37 @@ void main(
     // NOT the scale, and because it maps view space it changes as the camera
     // turns. Do not read _m00 or _m22 off it.
 
-    // ---- Blocker search (paper section 2.1) ---------------------------------
+    // ---- Blocker depth, with no search -------------------------------------
     //
-    // 16 Vogel taps inside a fixed max radius. The paper's blocker test has no
-    // explicit bias because in its demo the receiver's own surface and the shadow
-    // map agree to within rounding. MGSV renders casters with a slope-scaled
-    // rasterizer depth bias, so the receiver's own texels land slightly closer to
-    // the light and would be counted as blockers, pinning the penumbra. Hence the
-    // bias below, which reconstructs that rasterizer bias from the receiver's own
-    // depth gradient (normalised depth per texel).
-    const float texelsPerPixel = max(length(ddx(baseUV)) * atlasSize, 1e-6);
-    const float slopePerTexel  = abs(ddx(refZ)) / texelsPerPixel;
-    const float bias = min(PCSS_BIAS_BASE + PCSS_BIAS_SLOPE * slopePerTexel, PCSS_BIAS_MAX);
-
-    float blockerSum    = 0.0;
-    float blockerWeight = 0.0;
-    [unroll] for (int i = 0; i < PCSS_PCF_TAPS; ++i) {
-      const float2 v  = PcssVogelDisk(i, PCSS_PCF_TAPS, angle);
-      const float2 uv = clamp(baseUV + v * (PCSS_BLOCKER_RADIUS_TEXELS * texel), uvMin, uvMax);
-      const float  d  = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, uv, 0).x;
-      const float  w  = (d < refZ - bias) ? 1.0 : 0.0;
-      blockerSum += d * w;
-      blockerWeight += w;
-    }
+    // The shadow map stores the depth of the first surface the light ray through
+    // a texel hits. For a shadowed receiver that surface IS the caster, so the
+    // depth at the receiver's own texel is already the blocker depth. One read,
+    // exact, and independent of the cascade's texel size.
+    //
+    // A blocker *search* cannot be used here. Its radius has to be expressed in
+    // metres to reach a caster, and in cascade 0 a texel is 3.2 mm, so a 1 m
+    // radius is ~311 texels that 16 taps cannot cover. Expressed in texels
+    // instead, the same 12 texels covers 3.8 cm in cascade 0 and 36 cm in
+    // cascade 3, so the effect silently switched on and off with the cascade the
+    // player happened to be standing in — soft on distant terrain, vanilla on
+    // nearby objects.
+    //
+    // occ gates it: on a lit surface the stored depth is the receiver's own
+    // surface plus the engine's rasterizer bias, which is meaningless as a
+    // blocker. The comparison sampler is linear, so the ramp is smooth.
+    const float occ    = g_ShadowTexture.SampleCmpLevelZero(g_samplerComparisonLess_Linear_Clmap_s, baseUV, refZ).x;
+    const float caster = g_ShadowTexture.SampleLevel(g_samplerPoint_Clamp_s, baseUV, 0).x;
 
     // ---- Penumbra (paper section 2.1) --------------------------------------
     //
-    //   p = (z - avgBlocker) / avgBlocker;  penumbra = saturate(K * p * p)
+    //   p = (z - caster) / caster;  penumbra = saturate(K * p * p)
     //
     // A *relative* ratio, so it needs no depth range and does not depend on the
-    // shadow map's absolute units. That is what the earlier attempt got wrong: it
-    // used an absolute distance in metres, floored and capped, so it pinned to
-    // one of the two bounds instead of varying.
-    //
-    // No blockers means no penumbra, which keeps the shadow hard rather than
-    // smearing it across the whole cascade.
-    const float avgBlocker = blockerSum / max(blockerWeight, 1.0);
-    const float relDiff    = (refZ - avgBlocker) / max(avgBlocker, 1e-9);
-    const float penumbra01 = (blockerWeight > 0.0) ? saturate(PCSS_PENUMBRA_K * relDiff * relDiff) : 0.0;
+    // shadow map's absolute units. An earlier attempt at the own-texel read was
+    // abandoned because it scaled a fixed constant instead of this ratio and was
+    // not gated on occlusion, so it either did nothing or was uniformly soft.
+    const float relDiff    = (refZ - caster) / max(caster, 1e-9);
+    const float penumbra01 = occ * saturate(PCSS_PENUMBRA_K * relDiff * relDiff);
 
     // Scale the fixed max filter kernel. The floor keeps the result from getting
     // harder than vanilla's 0.5 texel PCF.
