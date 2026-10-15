@@ -92,21 +92,28 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 // pinned to one of the two bounds instead of varying.
 // ---------------------------------------------------------------------------
 #define PCSS_STRENGTH            1.0   // 0 = vanilla 4-tap PCF, 1 = full effect
-#define PCSS_PENUMBRA_K          8.0   // paper uses 80; this depth range is different
-#define PCSS_FILTER_MAX_TEXELS   16.0  // max shadow filter radius, texels. Kept in
-                                       // texels on purpose: it keeps the tap spacing
-                                       // uniform in every cascade, and it naturally
-                                       // gives a large world blur in the coarse far
-                                       // cascades. Too high a value lightens the
-                                       // interior of small shadows - 32 texels is
-                                       // 10 cm in cascade 0, which is most of a
-                                       // character's shadow, so the core washes out
-                                       // while the edge survives.
+#define PCSS_PENUMBRA_K          24.0  // sets how fast a given separation reaches the
+                                       // top of the range. Too high and every pixel
+                                       // saturates, the penumbra goes uniform, and
+                                       // the gradient - the hardening itself -
+                                       // disappears. relDiff is ~0.12 for a caster
+                                       // a metre up, so K near 32 leaves headroom.
+#define PCSS_PENUMBRA_MIN_WORLD  0.01  // penumbra at penumbra01 = 0, metres
+#define PCSS_PENUMBRA_MAX_WORLD  0.05  // penumbra at penumbra01 = 1, metres. Keep this
+                                       // under half the width of the smallest shadow
+                                       // you care about, or its dark core disappears
+                                       // and it reads as translucent rather than soft.
+                                       // It also sets the tap spacing: the radius in
+                                       // texels is this divided by the cascade texel
+                                       // size (3.2 mm in cascade 0), so 8 cm is ~25
+                                       // texels and needs the tap count below to
+                                       // resolve. Too few taps and the PCF result is
+                                       // a random sample of the shadow's coverage
+                                       // rather than its average, which reads as
+                                       // dithering - translucency, not a blur.
+#define PCSS_FILTER_MAX_TEXELS   128.0 // sampling guard, texels; rarely binds
 #define PCSS_FILTER_MIN_TEXELS   0.5   // never harder than vanilla's 0.5 texel PCF
-#define PCSS_BIAS                0.0001 // normalised depth (~6 cm); margin below the
-                                        // disk's own mean depth that a real caster
-                                        // must clear
-#define PCSS_PCF_TAPS            16
+#define PCSS_PCF_TAPS            32
 
 // Vogel disk: spreads samples evenly on a disk and, unlike a Poisson set, never
 // maps a sample onto another under rotation unless the rotation is a full turn.
@@ -474,9 +481,26 @@ void main(
     const float relDiff    = (refZ - caster) / max(caster, 1e-9);
     const float penumbra01 = occ * saturate(PCSS_PENUMBRA_K * relDiff * relDiff);
 
+    // Per-cascade texel size, from m_shadowProjection2's cascade ladder. Needed to
+    // express the penumbra in metres: a texel-space radius makes the blur's world
+    // size follow the cascade, and a PCF at radius R on a shadow of width W leaves
+    // a dark core only while R < W/2. 20 texels is 6.4 cm in cascade 0 and 31.7 cm
+    // in cascade 2, so the same shadow reads correctly in one cascade and washes
+    // out to 'half transparent' in the next.
+    const float cascadeIndex = tileXY.x + 2.0 * tileXY.y;
+    const float cascadeScale = cascadeIndex < 0.5 ? 1.0
+                             : cascadeIndex < 1.5 ? abs(g_psScene.m_shadowProjection2._m03)
+                             : cascadeIndex < 2.5 ? abs(g_psScene.m_shadowProjection2._m13)
+                                                  : abs(g_psScene.m_shadowProjection2._m23);
+    const float clipScale   = length(g_psScene.m_shadowProjection._m00_m10_m20);
+    const float worldPerClip = 1.0 / max(clipScale, 1e-9);
+    const float texelWorld  = (2.0 * worldPerClip) / (atlasSize * 0.5) / max(cascadeScale, 1e-6);
+
     // Scale the fixed max filter kernel. The floor keeps the result from getting
-    // harder than vanilla's 0.5 texel PCF.
-    const float penumbra = lerp(PCSS_FILTER_MIN_TEXELS, PCSS_FILTER_MAX_TEXELS, penumbra01);
+    // harder than vanilla's 0.5 texel PCF; the ceiling is only a sampling guard -
+    // a small texel radius is trivially well sampled, so it rarely binds.
+    const float penumbraWorld = lerp(PCSS_PENUMBRA_MIN_WORLD, PCSS_PENUMBRA_MAX_WORLD, penumbra01);
+    const float penumbra = clamp(penumbraWorld / texelWorld, PCSS_FILTER_MIN_TEXELS, PCSS_FILTER_MAX_TEXELS);
 
     // Variable-radius PCF with the game's own comparison sampler.
     float avg = 0.0;
@@ -487,8 +511,14 @@ void main(
     }
     avg /= (float)PCSS_PCF_TAPS;
 
+    // Keep vanilla's squaring. Removing it was tried and is wrong: it widens the
+    // gradient only by *lightening* partial occlusion, and a tree canopy is
+    // almost entirely partial occlusion - thin branches over a wide area - so it
+    // drops toward mid grey and reads as translucent rather than soft. Squaring
+    // keeps the core dark and narrows the transition, which is what a soft shadow
+    // should look like.
     float pcssLit = 1.0 - avg;
-    pcssLit *= pcssLit;  // keep vanilla's squaring
+    pcssLit *= pcssLit;
 
     r0.x = lerp(r0.x, pcssLit, PCSS_STRENGTH);
   }
