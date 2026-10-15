@@ -93,7 +93,9 @@ Texture2D<float4> g_SkyReflectTexture : register(t15);
 #define PCSS_PENUMBRA_FRACTION   0.06  // penumbra = worldDistance * this
 #define PCSS_MIN_PENUMBRA_WORLD  0.01  // metres; keeps contacts crisp
 #define PCSS_MAX_PENUMBRA_WORLD  0.50  // metres; cap on the exaggerated softening
-#define PCSS_MAX_PENUMBRA_TEXELS 32.0  // safety rail for the far cascades
+#define PCSS_MAX_PENUMBRA_TEXELS 256.0 // safety rail only; must not bind, or it
+                                       // reintroduces cascade dependence (one texel
+                                       // is 3.2 mm in cascade 0 and 30 mm in cascade 3)
 #define PCSS_BLOCKER_RADIUS_WORLD 0.5   // blocker search radius, metres
 #define PCSS_BIAS_WORLD          0.75  // depth margin, metres; excludes the receiver's own surface
 #define PCSS_BLOCKER_TAPS        16
@@ -407,14 +409,10 @@ void main(
 
     // Cascade tile window. The atlas is a 2x2 grid of 0.5-UV quadrants and the
     // vanilla UV lands inside exactly one of them, so the tile is simply the
-    // quadrant that contains baseUV.
-    //
-    // Snapping to the quadrant rather than reconstructing vanilla's own tile
-    // offset matters: during a cascade blend that offset is fractional, so the
-    // window slides across two tiles and the blocker search samples depth from
-    // an unrelated part of the world. That yields a bogus blocker depth, hence a
-    // bogus penumbra, and how often it happens depends on the camera.
-    const float2 tileOrigin = floor(baseUV * 2.0) * 0.5;
+    // quadrant that contains baseUV. tileXY doubles as the cascade index:
+    // vanilla's tile offset maps cascades 0..3 onto quadrants (0,0) (1,0) (0,1) (1,1).
+    const float2 tileXY = floor(baseUV * 2.0);
+    const float2 tileOrigin = tileXY * 0.5;
     const float2 uvMin = tileOrigin + 0.5 * texel;
     const float2 uvMax = tileOrigin + 0.5 - 0.5 * texel;
 
@@ -425,21 +423,36 @@ void main(
     const float  cs    = cos(angle);
     const float  sn    = sin(angle);
 
-    // How big one shadow texel is, in metres.
+    // Light-space metrics, measured from m_shadowProjection.
     //
-    // Taken from the projection diagonal: m_shadowProjection maps view space to
-    // shadow clip, so for this orthographic light 2 / |m00| is the world width
-    // the atlas covers and one cascade texel is that over (atlasSize / 2).
-    //
-    // A screen-space-derivative version (length(ddx(viewPos)) / length(ddx(uv)))
-    // was tried and is wrong here: it came back enormous, which collapsed the
-    // penumbra to the floor and made every shadow crisp. Do not reintroduce it
-    // without checking the resulting texel size against this value.
-    const float orthoWidth = 2.0 / max(abs(g_psScene.m_shadowProjection._m00), 1e-6);
-    const float texelWorld = clamp(orthoWidth / (atlasSize * 0.5), 1e-4, 10.0);
+    // That matrix is a *uniform scale times a rotation*: all three of its
+    // row/column norms come out equal (0.15202 in the captured frame), so the
+    // orthographic box is a cube and 2 / norm is its extent in metres. Do not
+    // read the scale off the diagonal (_m00 / _m22) — for a rotated matrix the
+    // diagonal elements are not scale factors, and because this matrix maps
+    // *view* space it changes as the camera turns. That is what made the
+    // penumbra camera-dependent.
+    const float clipScale = length(g_psScene.m_shadowProjection._m00_m10_m20);
+    const float worldPerClip = 1.0 / max(clipScale, 1e-9);
 
-    // Depth range of the light's orthographic box.
-    const float depthRange = 2.0 / max(abs(g_psScene.m_shadowProjection._m22), 1e-6);
+    // Per-cascade scale. m_shadowProjection2's rows 0..2 hold (offset.xyz, scale)
+    // and their .w values are the cascade ladder (0.41376 / 0.20271 / 0.10708 in
+    // the captured frame), so cascade i's ortho extent is 2 / clipScale / scale_i.
+    const float cascadeIndex = tileXY.x + 2.0 * tileXY.y;
+    const float cascadeScale = cascadeIndex < 0.5 ? 1.0
+                             : cascadeIndex < 1.5 ? abs(g_psScene.m_shadowProjection2._m03)
+                             : cascadeIndex < 2.5 ? abs(g_psScene.m_shadowProjection2._m13)
+                                                  : abs(g_psScene.m_shadowProjection2._m23);
+
+    // One cascade texel, in metres, for this pixel's cascade. Cascade 0 comes out
+    // at ~3.2 mm and cascade 3 at ~30 mm with the captured matrices.
+    const float cascadeTexels = atlasSize * 0.5;  // 4096 in the 8192 atlas
+    const float texelWorld = (2.0 * worldPerClip) / cascadeTexels / max(cascadeScale, 1e-6);
+
+    // Normalised shadow depth -> metres. Vanilla's refZ is (1 + clipZ) * zScale,
+    // so one refZ unit spans worldPerClip / zScale (~623 m in the captured frame).
+    const float zScale = max(abs(g_psScene.m_shadowProjection2._m30), 1e-9);
+    const float depthRange = worldPerClip / zScale;
 
     // Blocker search radius in metres, converted with this cascade's texel size.
     // A texel-space radius is the other half of the cascade-dependence bug: the
