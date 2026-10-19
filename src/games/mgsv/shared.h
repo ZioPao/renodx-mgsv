@@ -36,12 +36,32 @@ struct ShaderInjectData {
   float swap_chain_output_preset;
   float custom_motion_blur;
 
-  // Contact-hardening sun (directional light) shadows. Appended after every
-  // existing field so no established offset moves.
+  // Contact-hardening shadows. Appended after every existing field so no
+  // established offset moves.
   float sun_contact_hardening;
   float sun_shadow_softness;
   float sun_shadow_k;
   float sun_shadow_blur_pixels;
+
+  // Spot lights. Separate values because the scale differs: a spot's cone is
+  // tens of metres where the sun's cascade is hundreds, so the same separation
+  // produces a much larger ratio.
+  float spot_contact_hardening;
+  float spot_shadow_softness;
+  float spot_shadow_k;
+  float spot_shadow_blur_pixels;
+  float spot_shadow_darkness;
+  float spot_cone_falloff;
+
+  // Screen-space shadows. Appended after every existing field so no established
+  // offset moves.
+  float screen_space_shadows;
+  float ss_shadow_reach;
+  float ss_shadow_thickness;
+  float ss_shadow_strength;
+  float ss_shadow_fade_start;
+  float ss_shadow_fade_end;
+  float ss_shadow_material_max;
 };
 
 #ifndef __cplusplus
@@ -83,6 +103,21 @@ cbuffer cb13 : register(b13) {
 #define CUSTOM_SUN_SHADOW_SOFTNESS   shader_injection.sun_shadow_softness
 #define CUSTOM_SUN_SHADOW_K          shader_injection.sun_shadow_k
 #define CUSTOM_SUN_BLUR_PIXELS       shader_injection.sun_shadow_blur_pixels
+
+#define CUSTOM_SPOT_CONTACT_HARDENING shader_injection.spot_contact_hardening
+#define CUSTOM_SPOT_SHADOW_SOFTNESS   shader_injection.spot_shadow_softness
+#define CUSTOM_SPOT_SHADOW_K          shader_injection.spot_shadow_k
+#define CUSTOM_SPOT_BLUR_PIXELS       shader_injection.spot_shadow_blur_pixels
+#define CUSTOM_SPOT_SHADOW_DARKNESS   shader_injection.spot_shadow_darkness
+#define CUSTOM_SPOT_CONE_FALLOFF      shader_injection.spot_cone_falloff
+
+#define CUSTOM_SS_SHADOWS      shader_injection.screen_space_shadows
+#define CUSTOM_SS_REACH        shader_injection.ss_shadow_reach
+#define CUSTOM_SS_THICKNESS    shader_injection.ss_shadow_thickness
+#define CUSTOM_SS_STRENGTH     shader_injection.ss_shadow_strength
+#define CUSTOM_SS_FADE_START   shader_injection.ss_shadow_fade_start
+#define CUSTOM_SS_FADE_END     shader_injection.ss_shadow_fade_end
+#define CUSTOM_SS_MATERIAL_MAX shader_injection.ss_shadow_material_max
 
 #include "../../shaders/renodx.hlsl"
 
